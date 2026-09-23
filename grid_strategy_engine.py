@@ -68,6 +68,7 @@ def run_grid_backtest(
     reentry_drop_pct: float = 2.0,
     transaction_cost_bps: float = 5.0,
     stop_loss_pct: float | None = None,
+    reentry_reference: str = "post_exit_high",
     benchmark_name: str = "Buy & Hold",
 ) -> GridBacktestResult:
     """Simulate one fully invested position with target-sale and dip-rebuy orders.
@@ -87,6 +88,8 @@ def run_grid_backtest(
         raise ValueError("Transaction cost must be between 0 and 10,000 basis points.")
     if stop_loss_pct is not None and not 0 < stop_loss_pct < 100:
         raise ValueError("Stop loss must be between 0% and 100% when enabled.")
+    if reentry_reference not in {"post_exit_high", "sale_price"}:
+        raise ValueError("Re-entry reference must be 'post_exit_high' or 'sale_price'.")
 
     bars = _prepare_bars(ohlc)
     target_fraction = profit_target_pct / 100.0
@@ -100,7 +103,8 @@ def run_grid_backtest(
     entry_date: pd.Timestamp | None = bars.index[0]
     units = cash * (1.0 - fee_fraction) / entry_price
     cash = 0.0
-    next_entry_price: float | None = None
+    fixed_reentry_price: float | None = None
+    cash_high_water: float | None = None
     last_exit_date: pd.Timestamp | None = None
     trade_events = 1
     trades: list[dict[str, object]] = []
@@ -147,26 +151,33 @@ def run_grid_backtest(
                     }
                 )
                 units = 0.0
-                next_entry_price = exit_price * (1.0 - reentry_fraction)
+                fixed_reentry_price = exit_price * (1.0 - reentry_fraction)
+                cash_high_water = exit_price
                 entry_price = None
                 entry_date = None
                 last_exit_date = date
                 trade_events += 1
 
-        if (
-            units == 0
-            and next_entry_price is not None
-            and date != last_exit_date
-            and low <= next_entry_price
-        ):
-            fill_price = min(open_price, next_entry_price)
-            entry_capital = cash
-            units = cash * (1.0 - fee_fraction) / fill_price
-            cash = 0.0
-            entry_price = fill_price
-            entry_date = date
-            next_entry_price = None
-            trade_events += 1
+        if units == 0 and date != last_exit_date:
+            if reentry_reference == "post_exit_high" and cash_high_water is not None:
+                reentry_price = cash_high_water * (1.0 - reentry_fraction)
+            else:
+                reentry_price = fixed_reentry_price
+
+            if reentry_price is not None and low <= reentry_price:
+                fill_price = min(open_price, reentry_price)
+                entry_capital = cash
+                units = cash * (1.0 - fee_fraction) / fill_price
+                cash = 0.0
+                entry_price = fill_price
+                entry_date = date
+                fixed_reentry_price = None
+                cash_high_water = None
+                trade_events += 1
+            elif reentry_reference == "post_exit_high" and cash_high_water is not None:
+                # Update only after testing today's order. This avoids assuming
+                # that today's high occurred before today's low.
+                cash_high_water = max(cash_high_water, high)
 
         strategy_values.append(cash + units * close)
         exposure.append(1.0 if units > 0 else 0.0)
@@ -196,6 +207,13 @@ def run_grid_backtest(
     target_exits = sum(trade["Exit Reason"] == "Target" for trade in trades)
     stop_exits = sum(trade["Exit Reason"] == "Stop" for trade in trades)
     elapsed_years = max((bars.index[-1] - bars.index[0]).days / 365.25, 1 / 365.25)
+    waiting_reentry_price = None
+    if units == 0:
+        if reentry_reference == "post_exit_high" and cash_high_water is not None:
+            waiting_reentry_price = cash_high_water * (1.0 - reentry_fraction)
+        else:
+            waiting_reentry_price = fixed_reentry_price
+
     diagnostics: dict[str, object] = {
         "Completed round trips": len(trades),
         "Target exits": target_exits,
@@ -211,7 +229,8 @@ def run_grid_backtest(
             float(bars.iloc[-1]["Close"]) / entry_price - 1.0
             if units > 0 and entry_price is not None else np.nan
         ),
-        "Waiting re-entry price": next_entry_price,
+        "Waiting re-entry price": waiting_reentry_price,
+        "Re-entry reference": reentry_reference,
         "First data date": bars.index[0],
         "Last data date": bars.index[-1],
     }
@@ -224,3 +243,63 @@ def run_grid_backtest(
         trade_log=trade_log,
         diagnostics=diagnostics,
     )
+
+
+def find_parameters_for_trade_frequency(
+    ohlc: pd.DataFrame,
+    starting_capital: float = 10_000.0,
+    target_cycles_per_year: float = 100.0,
+    transaction_cost_bps: float = 5.0,
+    stop_loss_pct: float | None = None,
+    benchmark_name: str = "Buy & Hold",
+) -> tuple[GridBacktestResult, pd.DataFrame]:
+    """Find the tested 2%-3% target/pullback pair nearest a desired cycle rate.
+
+    This optimizes frequency, not profitability. The selected result and the
+    candidate table use the same historical period and are therefore in-sample.
+    """
+    if target_cycles_per_year <= 0:
+        raise ValueError("Target cycles per year must be positive.")
+
+    profit_targets = (2.0, 2.25, 2.5, 2.75, 3.0)
+    pullbacks = (0.0, 0.10, 0.25, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
+    candidates: list[dict[str, float]] = []
+    tested: list[GridBacktestResult] = []
+
+    for profit_target in profit_targets:
+        for pullback in pullbacks:
+            result = run_grid_backtest(
+                ohlc,
+                starting_capital=starting_capital,
+                profit_target_pct=profit_target,
+                reentry_drop_pct=pullback,
+                transaction_cost_bps=transaction_cost_bps,
+                stop_loss_pct=stop_loss_pct,
+                reentry_reference="post_exit_high",
+                benchmark_name=benchmark_name,
+            )
+            pace = float(result.diagnostics["Profitable cycles per year"])
+            candidates.append(
+                {
+                    "Profit Target %": profit_target,
+                    "Re-entry Pullback %": pullback,
+                    "Target Exits": float(result.diagnostics["Target exits"]),
+                    "Profitable Cycles/Year": pace,
+                    "Distance From Goal": abs(pace - target_cycles_per_year),
+                    "Total Return": float(
+                        result.metrics.loc["Grid Strategy", "Total Return"]
+                    ),
+                    "Maximum Drawdown": float(
+                        result.metrics.loc["Grid Strategy", "Maximum Drawdown"]
+                    ),
+                }
+            )
+            tested.append(result)
+
+    ranking = pd.DataFrame(candidates)
+    ranking["_result_index"] = range(len(ranking))
+    ranking = ranking.sort_values(
+        ["Distance From Goal", "Total Return"], ascending=[True, False]
+    ).reset_index(drop=True)
+    selected = tested[int(ranking.iloc[0]["_result_index"])]
+    return selected, ranking.drop(columns="_result_index")

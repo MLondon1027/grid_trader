@@ -7,7 +7,10 @@ import plotly.express as px
 import streamlit as st
 import yfinance as yf
 
-from grid_strategy_engine import run_grid_backtest
+from grid_strategy_engine import (
+    find_parameters_for_trade_frequency,
+    run_grid_backtest,
+)
 
 
 st.set_page_config(page_title="Grid Trading Backtest", page_icon="↕", layout="wide")
@@ -63,20 +66,40 @@ with st.sidebar:
     starting_capital = st.number_input(
         "Starting investment", min_value=100.0, value=10_000.0, step=1_000.0
     )
-    profit_target_pct = st.number_input(
-        "Sell target above entry (%)",
-        min_value=0.1,
-        max_value=25.0,
-        value=2.0,
-        step=0.1,
+    search_mode = st.radio(
+        "Parameter mode",
+        ["Find about 100 cycles/year", "Choose parameters manually"],
     )
-    reentry_drop_pct = st.number_input(
-        "Rebuy decline after sale (%)",
-        min_value=0.0,
-        max_value=25.0,
-        value=2.0,
-        step=0.1,
-    )
+    if search_mode.startswith("Find"):
+        target_cycles_per_year = st.number_input(
+            "Desired profitable cycles per year",
+            min_value=1,
+            max_value=180,
+            value=100,
+            step=5,
+        )
+        st.caption(
+            "Tests profit targets from 2% to 3% and re-entry pullbacks from 0% to 5%."
+        )
+    else:
+        profit_target_pct = st.number_input(
+            "Sell target above entry (%)",
+            min_value=0.1,
+            max_value=25.0,
+            value=2.0,
+            step=0.1,
+        )
+        reentry_drop_pct = st.number_input(
+            "Pullback from highest price after sale (%)",
+            min_value=0.0,
+            max_value=25.0,
+            value=0.5,
+            step=0.1,
+            help=(
+                "After selling, the app tracks new highs and buys when price pulls "
+                "back by this percentage. It does not require a return below the sale price."
+            ),
+        )
     transaction_cost_bps = st.number_input(
         "Cost per one-way order (basis points)",
         min_value=0.0,
@@ -112,15 +135,27 @@ if run:
     try:
         with st.spinner("Downloading prices and simulating orders…"):
             bars = download_ohlc(ticker, start_date, end_date)
-            result = run_grid_backtest(
-                bars,
-                starting_capital=starting_capital,
-                profit_target_pct=profit_target_pct,
-                reentry_drop_pct=reentry_drop_pct,
-                transaction_cost_bps=transaction_cost_bps,
-                stop_loss_pct=stop_loss_pct if use_stop else None,
-                benchmark_name=f"Buy & Hold {ticker}",
-            )
+            if search_mode.startswith("Find"):
+                result, parameter_search = find_parameters_for_trade_frequency(
+                    bars,
+                    starting_capital=starting_capital,
+                    target_cycles_per_year=target_cycles_per_year,
+                    transaction_cost_bps=transaction_cost_bps,
+                    stop_loss_pct=stop_loss_pct if use_stop else None,
+                    benchmark_name=f"Buy & Hold {ticker}",
+                )
+                selected_parameters = parameter_search.iloc[0]
+            else:
+                result = run_grid_backtest(
+                    bars,
+                    starting_capital=starting_capital,
+                    profit_target_pct=profit_target_pct,
+                    reentry_drop_pct=reentry_drop_pct,
+                    transaction_cost_bps=transaction_cost_bps,
+                    stop_loss_pct=stop_loss_pct if use_stop else None,
+                    reentry_reference="post_exit_high",
+                    benchmark_name=f"Buy & Hold {ticker}",
+                )
 
         grid = result.metrics.loc["Grid Strategy"]
         benchmark_name = next(
@@ -128,6 +163,28 @@ if run:
         )
         benchmark = result.metrics.loc[benchmark_name]
         diagnostics = result.diagnostics
+
+        if search_mode.startswith("Find"):
+            achieved = float(diagnostics["Profitable cycles per year"])
+            selected_text = (
+                f"Best frequency match: {selected_parameters['Profit Target %']:.2f}% "
+                f"profit target and {selected_parameters['Re-entry Pullback %']:.2f}% "
+                f"pullback, producing {achieved:.1f} profitable cycles per year."
+            )
+            if abs(achieved - target_cycles_per_year) <= 10:
+                st.success(selected_text)
+            else:
+                st.warning(
+                    selected_text
+                    + f" The tested rules could not get close to {target_cycles_per_year} "
+                    "without lowering the 2% minimum profit target."
+                )
+
+            with st.expander("View the closest parameter combinations"):
+                search_table = parameter_search.head(15).copy()
+                for column in ["Total Return", "Maximum Drawdown"]:
+                    search_table[column] = search_table[column].map(percent)
+                st.dataframe(search_table, hide_index=True, use_container_width=True)
 
         summary = st.columns(5)
         summary[0].metric(
@@ -268,7 +325,8 @@ if run:
         st.caption(
             "Daily adjusted OHLC bars are used. Same-day sale and rebuy are "
             "prohibited. If a stop and target are both touched on one bar, the "
-            "stop is assumed to execute first. A gap through an order fills at the open."
+            "stop is assumed to execute first. A gap through an order fills at the open. "
+            "Automatic parameter selection is in-sample and targets trade frequency, not return."
         )
     except Exception as exc:
         st.error(f"Backtest could not run: {exc}")
